@@ -210,98 +210,70 @@ def resolve_dataset_dir(trainset_dir):
     os.makedirs(local_dataset_dir, exist_ok=True)
     
     try:
-        from datasets import load_dataset
+        from huggingface_hub import snapshot_download
+        import glob
+        import zipfile
+        import tarfile
+        import pandas as pd
+        import io
         import soundfile as sf
         
-        # Load dataset
         token = os.getenv("HF_TOKEN")
-        ds = load_dataset(repo_id, token=token)
+        tmp_download_dir = tempfile.mkdtemp()
+        snapshot_download(repo_id=repo_id, repo_type="dataset", token=token, local_dir=tmp_download_dir)
         
-        # Find the first split that has data (e.g. 'train')
-        split_name = "train" if "train" in ds else list(ds.keys())[0]
-        split_data = ds[split_name]
-        
-        print(f"Extracting {len(split_data)} audio files from split '{split_name}'...")
-        for idx, row in enumerate(split_data):
-            # Check if there is an audio column
-            if "audio" in row:
-                audio_item = row["audio"]
-                if audio_item and isinstance(audio_item, dict) and "array" in audio_item:
-                    array = audio_item["array"]
-                    sr = audio_item["sampling_rate"]
-                    sf.write(os.path.join(local_dataset_dir, f"audio_{idx}.wav"), array, sr)
-        
-        return local_dataset_dir
-        
-    except Exception as e:
-        print(f"Error loading dataset via datasets library: {traceback.format_exc()}")
-        print("Falling back to snapshot download...")
-        
-        try:
-            from huggingface_hub import snapshot_download
-            import glob
-            import zipfile
-            import tarfile
-            
-            token = os.getenv("HF_TOKEN")
-            tmp_download_dir = tempfile.mkdtemp()
-            snapshot_download(repo_id=repo_id, repo_type="dataset", token=token, local_dir=tmp_download_dir)
-            
-            # Scrape for zip/tar files and extract them
-            for ext in ("*.zip", "*.tar.gz", "*.tar", "*.tgz", "*.7z"):
-                archive_files = glob.glob(os.path.join(tmp_download_dir, "**", ext), recursive=True)
-                for archive in archive_files:
-                    try:
-                        print(f"Extracting archive: {archive}")
-                        if archive.endswith(".zip"):
-                            with zipfile.ZipFile(archive, "r") as zip_ref:
-                                zip_ref.extractall(local_dataset_dir)
-                        elif archive.endswith((".tar.gz", ".tgz")):
-                            with tarfile.open(archive, "r:gz") as tar_ref:
-                                tar_ref.extractall(local_dataset_dir)
-                        elif archive.endswith(".tar"):
-                            with tarfile.open(archive, "r:") as tar_ref:
-                                tar_ref.extractall(local_dataset_dir)
-                    except Exception as ext_err:
-                        print(f"Failed to extract {archive}: {ext_err}")
-            
-            # Also copy any raw audio files directly
-            for ext in ("*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"):
-                audio_files = glob.glob(os.path.join(tmp_download_dir, "**", ext), recursive=True)
-                for audio in audio_files:
-                    try:
-                        shutil.copy(audio, local_dataset_dir)
-                    except Exception as cp_err:
-                        print(f"Failed to copy {audio}: {cp_err}")
-            
-            # Also scrape for parquet files and extract audio
-            import pandas as pd
-            import io
-            import soundfile as sf
-            parquet_files = glob.glob(os.path.join(tmp_download_dir, "**", "*.parquet"), recursive=True)
-            for pq_file in parquet_files:
+        # 1. Scrape for zip/tar files and extract them
+        for ext in ("*.zip", "*.tar.gz", "*.tar", "*.tgz", "*.7z"):
+            archive_files = glob.glob(os.path.join(tmp_download_dir, "**", ext), recursive=True)
+            for archive in archive_files:
                 try:
-                    print(f"Reading parquet: {pq_file}")
-                    df = pd.read_parquet(pq_file)
-                    if "audio" in df.columns:
-                        for row_idx, row in df.iterrows():
-                            audio_item = row["audio"]
-                            if audio_item and isinstance(audio_item, dict):
-                                array = audio_item.get("array")
-                                sr = audio_item.get("sampling_rate")
-                                if array is not None and sr is not None:
-                                    sf.write(os.path.join(local_dataset_dir, f"audio_{os.path.basename(pq_file)}_{row_idx}.wav"), array, sr)
-                                elif audio_item.get("bytes") is not None:
-                                    audio_bytes = audio_item["bytes"]
-                                    out_path = os.path.join(local_dataset_dir, f"audio_{os.path.basename(pq_file)}_{row_idx}.wav")
-                                    data, sr = sf.read(io.BytesIO(audio_bytes))
-                                    sf.write(out_path, data, sr)
-                except Exception as pq_err:
-                    print(f"Failed to extract parquet {pq_file}: {pq_err}")
-                        
-            return local_dataset_dir
-        except Exception as snap_err:
-            raise RuntimeError(f"Failed to download Hugging Face dataset from {trainset_dir}: {snap_err}")
+                    print(f"Extracting archive: {archive}")
+                    if archive.endswith(".zip"):
+                        with zipfile.ZipFile(archive, "r") as zip_ref:
+                            zip_ref.extractall(local_dataset_dir)
+                    elif archive.endswith((".tar.gz", ".tgz")):
+                        with tarfile.open(archive, "r:gz") as tar_ref:
+                            tar_ref.extractall(local_dataset_dir)
+                    elif archive.endswith(".tar"):
+                        with tarfile.open(archive, "r:") as tar_ref:
+                            tar_ref.extractall(local_dataset_dir)
+                except Exception as ext_err:
+                    print(f"Failed to extract {archive}: {ext_err}")
+        
+        # 2. Copy any raw audio files directly
+        for ext in ("*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"):
+            audio_files = glob.glob(os.path.join(tmp_download_dir, "**", ext), recursive=True)
+            for audio in audio_files:
+                try:
+                    shutil.copy(audio, local_dataset_dir)
+                except Exception as cp_err:
+                    print(f"Failed to copy {audio}: {cp_err}")
+        
+        # 3. Scrape for parquet files and extract audio
+        parquet_files = glob.glob(os.path.join(tmp_download_dir, "**", "*.parquet"), recursive=True)
+        for pq_file in parquet_files:
+            try:
+                print(f"Reading parquet: {pq_file}")
+                df = pd.read_parquet(pq_file)
+                if "audio" in df.columns:
+                    for row_idx, row in df.iterrows():
+                        audio_item = row["audio"]
+                        if audio_item and isinstance(audio_item, dict):
+                            array = audio_item.get("array")
+                            sr = audio_item.get("sampling_rate")
+                            if array is not None and sr is not None:
+                                sf.write(os.path.join(local_dataset_dir, f"audio_{os.path.basename(pq_file)}_{row_idx}.wav"), array, sr)
+                            elif audio_item.get("bytes") is not None:
+                                audio_bytes = audio_item["bytes"]
+                                out_path = os.path.join(local_dataset_dir, f"audio_{os.path.basename(pq_file)}_{row_idx}.wav")
+                                data, sr = sf.read(io.BytesIO(audio_bytes))
+                                sf.write(out_path, data, sr)
+            except Exception as pq_err:
+                print(f"Failed to extract parquet {pq_file}: {pq_err}")
+                    
+        return local_dataset_dir
+    except Exception as snap_err:
+        raise RuntimeError(f"Failed to download Hugging Face dataset from {trainset_dir}: {snap_err}")
 
 
 from subprocess import Popen
