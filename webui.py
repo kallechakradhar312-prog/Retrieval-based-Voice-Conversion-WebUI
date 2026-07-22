@@ -48,6 +48,237 @@ import gradio as gr
 import pathlib
 import json
 from time import sleep
+
+
+def uvr5_and_infer_cover(
+    model_name,
+    input_song_path,
+    spk_id,
+    vc_transform,
+    f0_method,
+    file_index,
+    index_rate,
+    vocal_volume,
+    inst_volume,
+):
+    import tempfile
+    import shutil
+    import glob
+    import traceback
+    import librosa
+    import soundfile as sf
+    import numpy as np
+
+    if not input_song_path:
+        return "请先上传歌曲音频 (Please upload a song first)", None, None, None, None
+
+    # Step 1: Vocal Separation (UVR5)
+    vocal_tmp_dir = tempfile.mkdtemp()
+    ins_tmp_dir = tempfile.mkdtemp()
+    song_tmp_dir = tempfile.mkdtemp()
+
+    try:
+        # Copy input song to song_tmp_dir so uvr can find it in the folder scan
+        shutil.copy(input_song_path, song_tmp_dir)
+
+        # Run uvr separation
+        # uvr(model_name, inp_root, save_root_vocal, paths, save_root_ins, agg, format0)
+        for status in uvr(model_name, song_tmp_dir, vocal_tmp_dir, None, ins_tmp_dir, 10, "wav"):
+            pass
+
+        # Locate the separated vocal and instrumental files
+        vocal_files = glob.glob(os.path.join(vocal_tmp_dir, "*.wav"))
+        ins_files = glob.glob(os.path.join(ins_tmp_dir, "*.wav"))
+
+        if not vocal_files or not ins_files:
+            return "人声与伴奏分离失败，请确认选择的模型是否正确 (UVR5 Separation failed)", None, None, None, None
+
+        vocal_path = vocal_files[0]
+        ins_path = ins_files[0]
+
+        # Step 2: Voice Conversion (Inference)
+        info, converted_vocal_path = vc.vc_single(
+            spk_id,
+            vocal_path,
+            vc_transform,
+            f0_method,
+            file_index,
+            index_rate,
+            0,     # resample_sr (0 to disable)
+            0.25,  # rms_mix_rate
+            0.33,  # protect
+        )
+
+        if not converted_vocal_path or not os.path.exists(converted_vocal_path):
+            return f"声音转换失败: {info} (Voice conversion failed)", vocal_path, ins_path, None, None
+
+        # Step 3: Merge/Mix the converted vocal and instrumental
+        y_inst, sr_inst = librosa.load(ins_path, sr=None, mono=False)
+        y_voc, sr_voc = librosa.load(converted_vocal_path, sr=sr_inst, mono=False)
+
+        # Align channels
+        if y_inst.ndim == 2 and y_voc.ndim == 1:
+            y_voc = np.vstack([y_voc, y_voc])
+        elif y_inst.ndim == 1 and y_voc.ndim == 2:
+            y_voc = np.mean(y_voc, axis=0)
+
+        # Align lengths
+        len_inst = y_inst.shape[-1]
+        len_voc = y_voc.shape[-1]
+        max_len = max(len_inst, len_voc)
+
+        if len_inst < max_len:
+            pad_width = max_len - len_inst
+            if y_inst.ndim == 2:
+                y_inst = np.pad(y_inst, ((0, 0), (0, pad_width)))
+            else:
+                y_inst = np.pad(y_inst, (0, pad_width))
+        elif len_voc < max_len:
+            pad_width = max_len - len_voc
+            if y_voc.ndim == 2:
+                y_voc = np.pad(y_voc, ((0, 0), (0, pad_width)))
+            else:
+                y_voc = np.pad(y_voc, (0, pad_width))
+
+        # Mix and normalize to prevent clipping
+        y_mixed = (y_inst * inst_volume) + (y_voc * vocal_volume)
+        max_val = np.max(np.abs(y_mixed))
+        if max_val > 1.0:
+            y_mixed = (y_mixed / max_val) * 0.98
+
+        # Save output cover
+        output_dir = os.path.join(now_dir, "opt")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Clean special chars from input name to make safe filename
+        safe_input_name = "".join([c for c in os.path.basename(input_song_path) if c.isalnum() or c in (".", "_", "-")])
+        final_cover_path = os.path.join(output_dir, f"cover_{safe_input_name}")
+        sf.write(final_cover_path, y_mixed.T if y_mixed.ndim == 2 else y_mixed, sr_inst)
+
+        # Move intermediate results to opt/ so they persist and Gradio can access them
+        vocal_opt_path = os.path.join(output_dir, f"vocal_{safe_input_name}")
+        ins_opt_path = os.path.join(output_dir, f"instrument_{safe_input_name}")
+        shutil.copy(vocal_path, vocal_opt_path)
+        shutil.copy(ins_path, ins_opt_path)
+
+        return (
+            "制作完成！您可以在下方播放或下载转换后的音频以及最终混合的歌曲。 (AI Cover Created Successfully!)",
+            vocal_opt_path,
+            ins_opt_path,
+            converted_vocal_path,
+            final_cover_path,
+        )
+
+    except Exception as e:
+        return f"发生错误: {traceback.format_exc()} (Error occurred)", None, None, None, None
+
+
+def resolve_dataset_dir(trainset_dir):
+    import re
+    import os
+    import shutil
+    import traceback
+    import tempfile
+    
+    def load_dotenv():
+        if os.path.exists(".env"):
+            with open(".env", "r", encoding="utf-8") as f:
+                for line in f:
+                    if "=" in line and not line.startswith("#"):
+                        k, v = line.strip().split("=", 1)
+                        os.environ[k.strip()] = v.strip()
+
+    load_dotenv()
+    
+    # Check if trainset_dir is a Hugging Face URL
+    hf_match = re.search(r"huggingface\.co/datasets/([^/]+/[^/?#]+)", trainset_dir)
+    if not hf_match:
+        # If it's a local folder path, just clean it and return
+        return trainset_dir.strip(" '\"\u202a")
+
+    repo_id = hf_match.group(1)
+    # Create a local folder name based on repo ID
+    safe_folder_name = repo_id.replace("/", "_")
+    local_dataset_dir = os.path.join(now_dir, "dataset", safe_folder_name)
+    
+    # If the folder already exists and has files, we don't need to download again
+    if os.path.exists(local_dataset_dir) and any(os.path.isfile(os.path.join(local_dataset_dir, f)) for f in os.listdir(local_dataset_dir)):
+        print(f"Dataset already downloaded and extracted at: {local_dataset_dir}")
+        return local_dataset_dir
+
+    print(f"Detected Hugging Face dataset URL. Downloading {repo_id}...")
+    os.makedirs(local_dataset_dir, exist_ok=True)
+    
+    try:
+        from datasets import load_dataset
+        import soundfile as sf
+        
+        # Load dataset
+        token = os.getenv("HF_TOKEN")
+        ds = load_dataset(repo_id, token=token)
+        
+        # Find the first split that has data (e.g. 'train')
+        split_name = "train" if "train" in ds else list(ds.keys())[0]
+        split_data = ds[split_name]
+        
+        print(f"Extracting {len(split_data)} audio files from split '{split_name}'...")
+        for idx, row in enumerate(split_data):
+            # Check if there is an audio column
+            if "audio" in row:
+                audio_item = row["audio"]
+                if audio_item and isinstance(audio_item, dict) and "array" in audio_item:
+                    array = audio_item["array"]
+                    sr = audio_item["sampling_rate"]
+                    sf.write(os.path.join(local_dataset_dir, f"audio_{idx}.wav"), array, sr)
+        
+        return local_dataset_dir
+        
+    except Exception as e:
+        print(f"Error loading dataset via datasets library: {traceback.format_exc()}")
+        print("Falling back to snapshot download...")
+        
+        try:
+            from huggingface_hub import snapshot_download
+            import glob
+            import zipfile
+            import tarfile
+            
+            token = os.getenv("HF_TOKEN")
+            tmp_download_dir = tempfile.mkdtemp()
+            snapshot_download(repo_id=repo_id, repo_type="dataset", token=token, local_dir=tmp_download_dir)
+            
+            # Scrape for zip/tar files and extract them
+            for ext in ("*.zip", "*.tar.gz", "*.tar", "*.tgz", "*.7z"):
+                archive_files = glob.glob(os.path.join(tmp_download_dir, "**", ext), recursive=True)
+                for archive in archive_files:
+                    try:
+                        print(f"Extracting archive: {archive}")
+                        if archive.endswith(".zip"):
+                            with zipfile.ZipFile(archive, "r") as zip_ref:
+                                zip_ref.extractall(local_dataset_dir)
+                        elif archive.endswith((".tar.gz", ".tgz")):
+                            with tarfile.open(archive, "r:gz") as tar_ref:
+                                tar_ref.extractall(local_dataset_dir)
+                        elif archive.endswith(".tar"):
+                            with tarfile.open(archive, "r:") as tar_ref:
+                                tar_ref.extractall(local_dataset_dir)
+                    except Exception as ext_err:
+                        print(f"Failed to extract {archive}: {ext_err}")
+            
+            # Also copy any raw audio files directly
+            for ext in ("*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"):
+                audio_files = glob.glob(os.path.join(tmp_download_dir, "**", ext), recursive=True)
+                for audio in audio_files:
+                    try:
+                        shutil.copy(audio, local_dataset_dir)
+                    except Exception as cp_err:
+                        print(f"Failed to copy {audio}: {cp_err}")
+                        
+            return local_dataset_dir
+        except Exception as snap_err:
+            raise RuntimeError(f"Failed to download Hugging Face dataset from {trainset_dir}: {snap_err}")
+
+
 from subprocess import Popen
 from random import shuffle
 import warnings
@@ -400,7 +631,7 @@ def train_task_stopped(state):
 
 def start_train_process(state, cmd):
     kwargs = {"shell": True, "cwd": now_dir}
-    if "train/train.py" in cmd.replace("\\", "/"):
+    if "train/train.py" in cmd.replace("\\", "/") or "-m train.train" in cmd:
         training_env = os.environ.copy()
         training_env["RVC_CUDA_GRAPH"] = "0"
         kwargs["env"] = training_env
@@ -477,7 +708,7 @@ def run_preprocess_dataset(trainset_dir, exp_dir, sr, n_p, state, format_output=
     log_path = "%s/logs/%s/preprocess.log" % (now_dir, exp_dir)
     with open(log_path, "w", encoding="utf8"):
         pass
-    cmd = '"%s" train/preprocess.py "%s" %s %s "%s/logs/%s" %s %.1f' % (
+    cmd = '"%s" -m train.preprocess "%s" %s %s "%s/logs/%s" %s %.1f' % (
         config.python_cmd,
         trainset_dir,
         sr,
@@ -514,6 +745,7 @@ def run_preprocess_dataset(trainset_dir, exp_dir, sr, n_p, state, format_output=
 
 
 def preprocess_dataset(trainset_dir, exp_dir, sr, n_p):
+    trainset_dir = resolve_dataset_dir(trainset_dir)
     action, state = begin_train_task("数据切分")
     if action == "busy":
         yield (
@@ -574,10 +806,10 @@ def run_extract_f0_feature(
         processes = []
         rmvpe_devices = [gpu for gpu in gpus_rmvpe.split("-") if gpu != ""]
         if f0method == "pm" or (
-            f0method == "rmvpe" and not rmvpe_devices and not config.dml
+            f0method == "rmvpe" and not rmvpe_devices
         ):
             cmd = (
-                '"%s" train/dataset/extract_f0.py cpu "%s/logs/%s" %s %s'
+                '"%s" -m train.dataset.extract_f0 cpu "%s/logs/%s" %s %s'
                 % (config.python_cmd, now_dir, exp_dir, n_p, f0method)
             )
             processes.append(start_train_process(state, cmd))
@@ -585,7 +817,7 @@ def run_extract_f0_feature(
             count = len(rmvpe_devices)
             for index, gpu in enumerate(rmvpe_devices):
                 cmd = (
-                    '"%s" train/dataset/extract_f0.py cuda %s %s %s "%s/logs/%s" %s'
+                    '"%s" -m train.dataset.extract_f0 cuda %s %s %s "%s/logs/%s" %s'
                     % (
                         config.python_cmd,
                         count,
@@ -599,7 +831,7 @@ def run_extract_f0_feature(
                 processes.append(start_train_process(state, cmd))
         else:
             cmd = (
-                '"%s" train/dataset/extract_f0.py dml "%s/logs/%s"'
+                '"%s" -m train.dataset.extract_f0 dml "%s/logs/%s"'
                 % (config.python_cmd, now_dir, exp_dir)
             )
             processes.append(start_train_process(state, cmd))
@@ -618,7 +850,7 @@ def run_extract_f0_feature(
         count = len(feature_gpus)
         for index, gpu in enumerate(feature_gpus):
             cmd = (
-                '"%s" train/dataset/extract_hubert_feature.py %s %s %s %s "%s/logs/%s" %s %s'
+                '"%s" -m train.dataset.extract_hubert_feature %s %s %s %s "%s/logs/%s" %s %s'
                 % (
                     config.python_cmd,
                     config.device,
@@ -634,7 +866,7 @@ def run_extract_f0_feature(
             processes.append(start_train_process(state, cmd))
     else:
         cmd = (
-            '"%s" train/dataset/extract_hubert_feature.py %s 1 0 "%s/logs/%s" %s %s'
+            '"%s" -m train.dataset.extract_hubert_feature %s 1 0 "%s/logs/%s" %s %s'
             % (
                 config.python_cmd,
                 config.device,
@@ -868,7 +1100,7 @@ def run_train_model(
             f.write("\n")
     if gpus16:
         cmd = (
-            '"%s" train/train.py -e "%s" -sr %s -f0 %s -bs %s -g %s -te %s -se %s %s %s -l %s -c %s -sw %s -v %s'
+            '"%s" -m train.train -e "%s" -sr %s -f0 %s -bs %s -g %s -te %s -se %s %s %s -l %s -c %s -sw %s -v %s'
             % (
                 config.python_cmd,
                 exp_dir1,
@@ -888,7 +1120,7 @@ def run_train_model(
         )
     else:
         cmd = (
-            '"%s" train/train.py -e "%s" -sr %s -f0 %s -bs %s -te %s -se %s %s %s -l %s -c %s -sw %s -v %s'
+            '"%s" -m train.train -e "%s" -sr %s -f0 %s -bs %s -te %s -se %s %s %s -l %s -c %s -sw %s -v %s'
             % (
                 config.python_cmd,
                 exp_dir1,
@@ -1008,7 +1240,7 @@ def run_train_index(exp_dir1, version19, state, format_output=True):
     with open(log_path, "w", encoding="utf8"):
         pass
     cmd = (
-        '"%s" train/train_index.py "%s" %s "%s" %s'
+        '"%s" -m train.train_index "%s" %s "%s" %s'
         % (
             config.python_cmd,
             exp_dir1,
@@ -1507,6 +1739,94 @@ with gr.Blocks(title="RVC WebUI") as app:
                         ],
                         [vc_output3],
                         api_name="infer_convert_batch",
+                    )
+            with gr.TabItem(i18n("AI歌曲封面制作 (AI Cover Creator)")):
+                with gr.Group():
+                    gr.Markdown(
+                        value=i18n(
+                            "一键制作：分离人声和伴奏 -> 转换人声音色 -> 自动合并最终歌曲封面 (Separated vocals will be converted and mixed with background music)"
+                        )
+                    )
+                    with gr.Row():
+                        with gr.Column():
+                            input_song_cover = gr.Audio(
+                                label=i18n("上传完整歌曲音频"),
+                                source="upload",
+                                type="filepath",
+                                interactive=True,
+                            )
+                            uvr5_model_cover = gr.Dropdown(
+                                label=i18n("选择人声分离模型"),
+                                choices=uvr5_names,
+                                value="HP2-人声singlesong",
+                                interactive=True,
+                            )
+                            vc_transform_cover = gr.Number(
+                                label=i18n("变调 (整数, 半音数量, 升八度12降八度-12)"),
+                                value=0,
+                            )
+                            f0method_cover = gr.Radio(
+                                label=i18n("音高提取算法"),
+                                choices=["pm", "rmvpe", "fcpe"],
+                                value="rmvpe",
+                                interactive=True,
+                            )
+                            index_rate_cover = gr.Slider(
+                                minimum=0,
+                                maximum=1,
+                                label=i18n("检索特征占比"),
+                                value=0.75,
+                                step=0.01,
+                                interactive=True,
+                            )
+                            vocal_vol_cover = gr.Slider(
+                                minimum=0,
+                                maximum=2,
+                                label=i18n("人声音量倍数"),
+                                value=1.0,
+                                step=0.05,
+                                interactive=True,
+                            )
+                            inst_vol_cover = gr.Slider(
+                                minimum=0,
+                                maximum=2,
+                                label=i18n("伴奏音量倍数"),
+                                value=1.0,
+                                step=0.05,
+                                interactive=True,
+                            )
+                        with gr.Column():
+                            but_cover = gr.Button(i18n("一键制作AI Cover"), variant="primary")
+                            info_cover = gr.Textbox(label=i18n("输出状态/信息"))
+                            with gr.Group():
+                                gr.Markdown("### " + i18n("人声与伴奏分离结果"))
+                                uvr_vocal_out = gr.Audio(label=i18n("提取出的人声 (Model Input)"))
+                                uvr_inst_out = gr.Audio(label=i18n("提取出的伴奏 (Backing Track)"))
+                            with gr.Group():
+                                gr.Markdown("### " + i18n("最终AI歌曲封面"))
+                                converted_vocal_out = gr.Audio(label=i18n("转换后的人声"))
+                                final_cover_out = gr.Audio(label=i18n("合成后的完整歌曲"))
+
+                    but_cover.click(
+                        uvr5_and_infer_cover,
+                        [
+                            uvr5_model_cover,
+                            input_song_cover,
+                            spk_item,
+                            vc_transform_cover,
+                            f0method_cover,
+                            file_index1,
+                            index_rate_cover,
+                            vocal_vol_cover,
+                            inst_vol_cover,
+                        ],
+                        [
+                            info_cover,
+                            uvr_vocal_out,
+                            uvr_inst_out,
+                            converted_vocal_out,
+                            final_cover_out,
+                        ]
                     )
                 sid0.change(
                     fn=vc.get_vc,

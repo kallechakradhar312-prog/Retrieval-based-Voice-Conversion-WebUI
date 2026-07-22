@@ -114,7 +114,7 @@ else:
 
 # Do not expose an unsupported CUDA device as the inference default.
 if infer_device.type != "cuda":
-    if DML_AVAILABLE:
+    if DML_AVAILABLE and "--dml" in sys.argv:
         infer_device, infer_dtype, infer_gpu_mem = (
             DML_DEVICE,
             torch.float32,
