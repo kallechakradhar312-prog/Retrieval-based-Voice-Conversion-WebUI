@@ -273,6 +273,31 @@ def resolve_dataset_dir(trainset_dir):
                         shutil.copy(audio, local_dataset_dir)
                     except Exception as cp_err:
                         print(f"Failed to copy {audio}: {cp_err}")
+            
+            # Also scrape for parquet files and extract audio
+            import pandas as pd
+            import io
+            import soundfile as sf
+            parquet_files = glob.glob(os.path.join(tmp_download_dir, "**", "*.parquet"), recursive=True)
+            for pq_file in parquet_files:
+                try:
+                    print(f"Reading parquet: {pq_file}")
+                    df = pd.read_parquet(pq_file)
+                    if "audio" in df.columns:
+                        for row_idx, row in df.iterrows():
+                            audio_item = row["audio"]
+                            if audio_item and isinstance(audio_item, dict):
+                                array = audio_item.get("array")
+                                sr = audio_item.get("sampling_rate")
+                                if array is not None and sr is not None:
+                                    sf.write(os.path.join(local_dataset_dir, f"audio_{os.path.basename(pq_file)}_{row_idx}.wav"), array, sr)
+                                elif audio_item.get("bytes") is not None:
+                                    audio_bytes = audio_item["bytes"]
+                                    out_path = os.path.join(local_dataset_dir, f"audio_{os.path.basename(pq_file)}_{row_idx}.wav")
+                                    data, sr = sf.read(io.BytesIO(audio_bytes))
+                                    sf.write(out_path, data, sr)
+                except Exception as pq_err:
+                    print(f"Failed to extract parquet {pq_file}: {pq_err}")
                         
             return local_dataset_dir
         except Exception as snap_err:
