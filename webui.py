@@ -173,7 +173,7 @@ def uvr5_and_infer_cover(
         return f"发生错误: {traceback.format_exc()} (Error occurred)", None, None, None, None
 
 
-def resolve_dataset_dir(trainset_dir):
+def resolve_dataset_dir(trainset_dir, limit=0):
     import re
     import os
     import shutil
@@ -201,12 +201,25 @@ def resolve_dataset_dir(trainset_dir):
     safe_folder_name = repo_id.replace("/", "_")
     local_dataset_dir = os.path.join(now_dir, "dataset", safe_folder_name)
     
-    # If the folder already exists and has files, we don't need to download again
-    if os.path.exists(local_dataset_dir) and any(os.path.isfile(os.path.join(local_dataset_dir, f)) for f in os.listdir(local_dataset_dir)):
-        print(f"Dataset already downloaded and extracted at: {local_dataset_dir}")
+    # Caching checks
+    marker_file = os.path.join(local_dataset_dir, ".fully_extracted")
+    current_files = [f for f in os.listdir(local_dataset_dir) if os.path.isfile(os.path.join(local_dataset_dir, f))] if os.path.exists(local_dataset_dir) else []
+    
+    limit = int(limit)
+    should_skip = False
+    if os.path.exists(local_dataset_dir):
+        if os.path.exists(marker_file):
+            should_skip = True
+        elif limit > 0 and len(current_files) == limit:
+            should_skip = True
+
+    if should_skip:
+        print(f"Dataset already extracted at: {local_dataset_dir}")
         return local_dataset_dir
 
     print(f"Detected Hugging Face dataset URL. Downloading {repo_id}...")
+    if os.path.exists(local_dataset_dir):
+        shutil.rmtree(local_dataset_dir)
     os.makedirs(local_dataset_dir, exist_ok=True)
     
     try:
@@ -222,7 +235,10 @@ def resolve_dataset_dir(trainset_dir):
         tmp_download_dir = tempfile.mkdtemp()
         snapshot_download(repo_id=repo_id, repo_type="dataset", token=token, local_dir=tmp_download_dir)
         
-        # 1. Scrape for zip/tar files and extract them
+        # Temp folder to extract archives
+        archive_extract_dir = tempfile.mkdtemp()
+        
+        # 1. Scrape for zip/tar files and extract them to archive_extract_dir
         for ext in ("*.zip", "*.tar.gz", "*.tar", "*.tgz", "*.7z"):
             archive_files = glob.glob(os.path.join(tmp_download_dir, "**", ext), recursive=True)
             for archive in archive_files:
@@ -230,47 +246,75 @@ def resolve_dataset_dir(trainset_dir):
                     print(f"Extracting archive: {archive}")
                     if archive.endswith(".zip"):
                         with zipfile.ZipFile(archive, "r") as zip_ref:
-                            zip_ref.extractall(local_dataset_dir)
+                            zip_ref.extractall(archive_extract_dir)
                     elif archive.endswith((".tar.gz", ".tgz")):
                         with tarfile.open(archive, "r:gz") as tar_ref:
-                            tar_ref.extractall(local_dataset_dir)
+                            tar_ref.extractall(archive_extract_dir)
                     elif archive.endswith(".tar"):
                         with tarfile.open(archive, "r:") as tar_ref:
-                            tar_ref.extractall(local_dataset_dir)
+                            tar_ref.extractall(archive_extract_dir)
                 except Exception as ext_err:
                     print(f"Failed to extract {archive}: {ext_err}")
         
-        # 2. Copy any raw audio files directly
-        for ext in ("*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"):
-            audio_files = glob.glob(os.path.join(tmp_download_dir, "**", ext), recursive=True)
-            for audio in audio_files:
-                try:
-                    shutil.copy(audio, local_dataset_dir)
-                except Exception as cp_err:
-                    print(f"Failed to copy {audio}: {cp_err}")
-        
-        # 3. Scrape for parquet files and extract audio
+        total_extracted = 0
+
+        # 2. Extract from parquet files first
         parquet_files = glob.glob(os.path.join(tmp_download_dir, "**", "*.parquet"), recursive=True)
         for pq_file in parquet_files:
+            if limit > 0 and total_extracted >= limit:
+                break
             try:
                 print(f"Reading parquet: {pq_file}")
                 df = pd.read_parquet(pq_file)
                 if "audio" in df.columns:
                     for row_idx, row in df.iterrows():
+                        if limit > 0 and total_extracted >= limit:
+                            break
                         audio_item = row["audio"]
                         if audio_item and isinstance(audio_item, dict):
                             array = audio_item.get("array")
                             sr = audio_item.get("sampling_rate")
                             if array is not None and sr is not None:
                                 sf.write(os.path.join(local_dataset_dir, f"audio_{os.path.basename(pq_file)}_{row_idx}.wav"), array, sr)
+                                total_extracted += 1
                             elif audio_item.get("bytes") is not None:
                                 audio_bytes = audio_item["bytes"]
                                 out_path = os.path.join(local_dataset_dir, f"audio_{os.path.basename(pq_file)}_{row_idx}.wav")
                                 data, sr = sf.read(io.BytesIO(audio_bytes))
                                 sf.write(out_path, data, sr)
+                                total_extracted += 1
             except Exception as pq_err:
                 print(f"Failed to extract parquet {pq_file}: {pq_err}")
-                    
+
+        # 3. Copy audio files from raw download and extracted archives
+        search_dirs = [tmp_download_dir, archive_extract_dir]
+        for s_dir in search_dirs:
+            if limit > 0 and total_extracted >= limit:
+                break
+            for ext in ("*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"):
+                if limit > 0 and total_extracted >= limit:
+                    break
+                audio_files = glob.glob(os.path.join(s_dir, "**", ext), recursive=True)
+                for audio in audio_files:
+                    if limit > 0 and total_extracted >= limit:
+                        break
+                    try:
+                        shutil.copy(audio, local_dataset_dir)
+                        total_extracted += 1
+                    except Exception as cp_err:
+                        print(f"Failed to copy {audio}: {cp_err}")
+        
+        # Clean up temp folders
+        shutil.rmtree(tmp_download_dir, ignore_errors=True)
+        shutil.rmtree(archive_extract_dir, ignore_errors=True)
+        
+        print(f"Extraction completed. Total samples saved: {total_extracted}")
+        
+        # Set marker file if fully extracted
+        if limit == 0 or total_extracted < limit:
+            with open(marker_file, "w") as f:
+                f.write("yes")
+                
         return local_dataset_dir
     except Exception as snap_err:
         raise RuntimeError(f"Failed to download Hugging Face dataset from {trainset_dir}: {snap_err}")
@@ -741,8 +785,8 @@ def run_preprocess_dataset(trainset_dir, exp_dir, sr, n_p, state, format_output=
         validate_preprocess_outputs(exp_dir)
 
 
-def preprocess_dataset(trainset_dir, exp_dir, sr, n_p):
-    trainset_dir = resolve_dataset_dir(trainset_dir)
+def preprocess_dataset(trainset_dir, exp_dir, sr, n_p, sample_limit=0):
+    trainset_dir = resolve_dataset_dir(trainset_dir, limit=sample_limit)
     action, state = begin_train_task("数据切分")
     if action == "busy":
         yield (
@@ -1943,6 +1987,11 @@ with gr.Blocks(title="RVC WebUI") as app:
                         value=0,
                         interactive=True,
                     )
+                    hf_sample_limit = gr.Number(
+                        label=i18n("Hugging Face数据集样本数限制 (0表示全部)"),
+                        value=0,
+                        interactive=True,
+                    )
                     but1 = gr.Button(i18n("处理数据"), variant="primary")
                     stop_but1 = gr.Button(
                         i18n("停止处理数据"), variant="stop", visible=False
@@ -1950,7 +1999,7 @@ with gr.Blocks(title="RVC WebUI") as app:
                     info1 = gr.Textbox(label=i18n("输出信息"), value="")
                     but1.click(
                         preprocess_dataset,
-                        [trainset_dir4, exp_dir1, sr2, np7],
+                        [trainset_dir4, exp_dir1, sr2, np7, hf_sample_limit],
                         [info1, but1, stop_but1],
                         api_name="train_preprocess",
                     )
