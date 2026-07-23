@@ -223,6 +223,13 @@ def resolve_dataset_dir(trainset_dir, limit=0):
     os.makedirs(local_dataset_dir, exist_ok=True)
     
     try:
+        try:
+            import tqdm
+            import threading
+            tqdm.tqdm._lock = threading.RLock()
+        except Exception:
+            pass
+            
         from huggingface_hub import snapshot_download
         import glob
         import zipfile
