@@ -14,10 +14,11 @@ def load_dotenv():
 def main():
     load_dotenv()
     token = os.getenv("HF_TOKEN")
-    if not token:
-        raise ValueError("HF_TOKEN not found in environment or .env file.")
-    print("Logging into Hugging Face...")
-    login(token=token)
+    if token:
+        print("Logging into Hugging Face...")
+        login(token=token)
+    else:
+        print("HF_TOKEN not found in environment or .env file. Proceeding with public download...")
 
     # Make directories
     os.makedirs("assets/hubert_base", exist_ok=True)
