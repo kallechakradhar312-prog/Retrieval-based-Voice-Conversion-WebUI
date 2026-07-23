@@ -1359,7 +1359,9 @@ def train1key(
     if_save_every_weights18,
     version19,
     gpus_rmvpe,
+    sample_limit=0,
 ):
+    trainset_dir4 = resolve_dataset_dir(trainset_dir4, limit=sample_limit)
     known_models = tuple(weight_names())
     action, state = begin_train_task("一键训练")
     if action == "busy":
@@ -2235,6 +2237,7 @@ with gr.Blocks(title="RVC WebUI") as app:
                             if_save_every_weights18,
                             version19,
                             gpus_rmvpe,
+                            hf_sample_limit,
                         ],
                         [info3, but5, stop_but5, sid0],
                         api_name="train_start_all",
